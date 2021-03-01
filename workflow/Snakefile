@@ -1,0 +1,126 @@
+# Load modules
+import glob
+import os
+import math
+import pdb
+import shutil
+import pandas as pd
+import scipy.stats
+import yaml
+import random
+import copy
+
+# Get the date
+from datetime import datetime
+i = datetime.now()
+TIME = i.strftime('%Y-%m-%d')
+
+# Specify config file
+configfile: "workflow/config.yml"
+
+SAMPS = {} #This dictionary will hold bam file names and directories as key, value pairs
+with open(config['bam_list'], 'r') as bams:
+    for bam in bams: SAMPS[os.path.basename(bam).strip().replace('.bam','')] = os.path.dirname(bam)
+
+# Make subdirectories
+dirs = [f"{os.getcwd()}/{x}" for x in ["coverage", "accessory", "OandE", "ratios", "scripts", "figures", "results", "cnvkit"]]
+for directory in dirs:
+    if not os.path.exists(directory): os.mkdir(directory)
+
+#Format command to singularity
+if config['singularity']['use_singularity'] == 'true' and config['singularity']['image'] != "none":
+    bind_paths = ",".join(set(list(SAMPS.values()) + dirs)) #Add unique directories to the list of paths to bind to singularity command
+    CMD_PREFIX = f"set +u; {config['singularity']['module']}; singularity exec --bind {bind_paths} {config['singularity']['image']}"
+    CODE = config['singularity']['code']
+else:
+    CMD_PREFIX = config['cmd_prefix']
+    CODE = config['dir']['code']
+
+BASE = config['outname']  # Base prefix used for naming files is set as basename of
+
+# Determine jobs to run locally vs on cluster.
+if config['run_settings']['local_run'] == 'true':
+    localrules: all, calcFreq, calcIBS, catIBS, calcPCA, controlMatch, admixMap, blink_GWAS, extract_optimum_popnum, cat_admixMap
+else:
+    localrules: all, extract_optimum_popnum, cat_admixMap
+    assert config['run_settings']['scheduler'] in ['pbs', 'slurm'], print(f"\nThe scheduler specified at run_settings -> scheduler: \'{config['run_settings']['scheduler']}\' is invalid.\n")
+    assert os.path.exists(config['run_settings']['cluster_config']), print(f"\nMust provide a cluster configuration file under run_settings -> cluster_config in the config.yml file\nFile \'{config['run_settings']['cluster_config']}\' does not exist\n")
+
+
+##Main part of snakemake workflow.
+rule all: #Main function that determines which files snakemake will attempt to produce upon running
+    input: f"coverage/{BASE}.reference.cnn",
+            expand(f"results/{{sample}}.cns", sample = [f"{os.path.basename(x).replace('.bam','')}" for x in SAMPS.keys()]),
+            expand(f"results/{{sample}}.call", sample = [f"{os.path.basename(x).replace('.bam','')}" for x in SAMPS.keys()]),
+            expand(f"figures/{{sample}}-scatter.pdf", sample = [f"{os.path.basename(x).replace('.bam','')}" for x in SAMPS.keys()]),
+            expand(f"figures/{{sample}}-diagram.pdf", sample = [f"{os.path.basename(x).replace('.bam','')}" for x in SAMPS.keys()])
+
+rule make_access: #Make accessibility file if one is not provided by the user
+    output: f"accessory/{BASE}.access.bed"
+    run:
+        if os.path.exists(config['cnvkit']['accessibility']): #If user provided a valid file, simply copy to accessory directory
+            shell(f"cp {config['cnvkit']['accessibility']} accessory/{BASE}.access.bed")
+        else: #If not, create the accessibility file using the fasta file
+            cmd = f"{CMD_PREFIX} cnvkit.py access {config['cnvkit']['fasta']} -o accessory/{BASE}.access.bed"
+            if os.path.exists(config['cnvkit']['excluded_regions']): cmd += f" -x {config['cnvkit']['excluded_regions']}" #If provided, incorporate excluded regions into creation of accesibility file
+            shell(cmd)
+
+# rule make_targets:
+#     output: f"accessory/{BASE}.targets.bed"
+#     shell: f"{CMD_PREFIX} cnvkit.py target {config['cnvkit']['targets']} --annotate {config['cnvkit']['annotation']} --split -o accessory/{BASE}.targets.bed"
+#
+# rule make_antitargets:
+#     input: f"accessory/{BASE}.targets.bed", f"accessory/{BASE}.access.bed"
+#     output: f"accessory/{BASE}.antitargets.bed"
+#     shell: f"{CMD_PREFIX} cnvkit.py antitarget {input[0]} -g {input[1]} -o accessory/{BASE}.antitargets.bed"
+
+rule autobin: #Generates target and (if relevant) antitarget BED files, and prints a table of estimated average read depths and recommended bin sizes on standard output.
+    input: f"accessory/{BASE}.access.bed"
+    output: f"accessory/{os.path.basename(config['cnvkit']['targets']).replace('.bed','')}.target.bed",
+            f"accessory/{os.path.basename(config['cnvkit']['targets']).replace('.bed','')}.antitarget.bed"
+    params: samp_list = ' '.join([f"{y}/{x}.bam" for x,y in SAMPS.items()]) #Create list of all sample bam files
+    shell:
+        f"{CMD_PREFIX} cnvkit.py autobin {{params.samp_list}} -t {config['cnvkit']['targets']} -g {input} --annotate {config['cnvkit']['annotation']} -m {config['cnvkit']['seq_method']};"
+        f"mv {os.path.basename(config['cnvkit']['targets']).replace('.bed','')}* accessory"
+
+rule calc_target_coverage: #Calculate coverage in the target regions from BAM read depths.
+    input: f"accessory/{os.path.basename(config['cnvkit']['targets']).replace('.bed','')}.target.bed"
+    output: f"coverage/{{sample}}.target.cnn"
+    params: dir = lambda wildcards: SAMPS[wildcards.sample]
+    shell: f"{CMD_PREFIX} cnvkit.py coverage {{params.dir}}/{{wildcards.sample}}.bam {{input}} -o coverage/{{wildcards.sample}}.target.cnn"
+
+rule calc_antitarget_coverage: #Calculate coverage in the antitarget regions from BAM read depths.
+    input: f"accessory/{os.path.basename(config['cnvkit']['targets']).replace('.bed','')}.antitarget.bed"
+    output: f"coverage/{{sample}}.antitarget.cnn"
+    params: dir = lambda wildcards: SAMPS[wildcards.sample]
+    shell: f"{CMD_PREFIX} cnvkit.py coverage {{params.dir}}/{{wildcards.sample}}.bam {{input}} -o coverage/{{wildcards.sample}}.antitarget.cnn"
+
+rule make_reference: #Compile a copy-number reference from the bam files.  Using the input samples in this way is only advised for detecting Germline CNVs.  For paired tumor-normal samples, the reference should be built off of the normal samples.
+    input: expand(f"coverage/{{sample}}.target.cnn", sample = SAMPS.keys()),
+            expand(f"coverage/{{sample}}.antitarget.cnn", sample = SAMPS.keys())
+    output: f"coverage/{BASE}.reference.cnn"
+    shell: f"{CMD_PREFIX} cnvkit.py reference coverage/*target.cnn -f {config['cnvkit']['fasta']} -o coverage/{BASE}.reference.cnn"
+
+rule calc_CNratios: #Combine the uncorrected target and antitarget coverage tables (.cnn) and correct for biases in regional coverage and GC content, according to the given reference. Output a table of copy number ratios (.cnr).
+    input: f"coverage/{{sample}}.target.cnn", f"coverage/{{sample}}.antitarget.cnn", f"coverage/{BASE}.reference.cnn"
+    output: f"ratios/{{sample}}.cnr"
+    shell: f"{CMD_PREFIX} cnvkit.py fix {{input[0]}} {{input[1]}} {{input[2]}} -i {{wildcards.sample}} -o {{output}}"
+
+rule segment_CNVs #Infer discrete copy number segments from the given coverage table
+    input: f"ratios/{{sample}}.cnr"
+    output: f"results/{{sample}}.cns", f"results/{{sample}}.segmetrics.cns"
+    shell:
+        f"{CMD_PREFIX} cnvkit.py segment {{input}} -m {config['cnvkit']['segment_method']} -o {{output[0]}}; "
+        f"{CMD_PREFIX} cnvkit.py segmetrics {{input}} -s {{output[0]}} --ci --pi -o {{output[1]}}"
+
+rule call_CNVs: #Given segmented log2 ratio estimates (.cns), derive each segment’s absolute integer copy number using either
+    input: f"results/{{sample}}.segmetrics.cns"
+    output: f"results/{{sample}}.call"
+    shell: f"{CMD_PREFIX} cnvkit.py call --filter {config['cnvkit']['filter_method']} -o {{output}} {{input}}"
+
+rule make_plots: #Use CNVkits plotting ability to generate a scatterplot and CNV diagram for each sample
+    input: f"ratios/{{sample}}.cnr", f"results/{{sample}}.cns"
+    output: f"figures/{{sample}}-scatter.pdf", f"figures/{{sample}}-diagram.pdf"
+    shell:
+        f"{CMD_PREFIX} cnvkit.py scatter {{input[0]}} -s {{input[1]}} -o figures/{{wildcards.sample}}-scatter.pdf;"
+        f"{CMD_PREFIX} cnvkit.py diagram {{input[0]}} -s {{input[1]}} -o figures/{{wildcards.sample}}-diagram.pdf"

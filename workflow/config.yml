@@ -1,0 +1,22 @@
+#Modify all lines indicated with MODIFY
+bam_list: "/home/spectorl/pmonnaha/misc/osteoCNV_included_samps.txt" #MODIFY: Text file containing paths to bam files (one sample per line).
+outname: "osteoCNV" # MODIFY: prefix used for naming output
+cnvkit:
+  segment_method: 'hmm-germline' # cbs,flasso,haar,none,hmm,hmm-tumor,hmm-germline
+  seq_method: 'hybrid' # hybrid,amplicon,wgs
+  annotation: '/home/spectorl/pmonnaha/misc/refFlat.txt'
+  accessibility: '/home/spectorl/pmonnaha/misc/access-5k-mappable.hg19.bed'
+  excluded_regions: 'none' # Optional; not used if accessibility file is provided.
+  fasta: '/home/spectorl/pmonnaha/misc/hg19.fa'
+  targets: '/home/spectorl/pmonnaha/misc/agilent_ExCap_S04380219_Padded.bed'
+  filter_method: 'ci'  #Options are cn, ampdel, ci, and sem.  Only 'ci' has been tested.  This filter removes any CNV calls where confidence interval overlaps with 0.
+singularity:
+  use_singularity: 'true'
+  image: '/home/pmonnaha/pmonnaha/singularity/cnvkit_latest.sif' # MODIFY
+  code: 'scripts/'
+  module: 'module load singularity'
+run_settings:
+  local_run: 'false'
+  cluster_config: 'workflow/cluster.yaml'
+  scheduler: 'pbs'
+cmd_prefix: "module load plink/1.90b6.10; module load htslib/1.6; module load bcftools/1.9;"
